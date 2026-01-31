@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for RAG Chat Assistant
 
 # Stage 1: Build stage
-FROM python:3.13-slim as builder
+FROM python:3.13-slim AS builder
 
 # Install UV
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -9,20 +9,18 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Set working directory
 WORKDIR /app
 
-# Copy dependency files
-COPY pyproject.toml ./
+# Copy all files needed for installation
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
 
-# Install dependencies using UV
-RUN uv pip install --system -e .
+# Install dependencies using UV (not editable for Docker)
+RUN uv pip install --system .
 
 # Stage 2: Runtime stage
 FROM python:3.13-slim
 
 # Set working directory
 WORKDIR /app
-
-# Install UV in runtime
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages

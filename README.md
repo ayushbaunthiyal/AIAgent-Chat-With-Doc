@@ -1,341 +1,602 @@
 # RAG Chat Assistant
 
-A conversational AI assistant that answers questions about content from document collections using RAG (Retrieval-Augmented Generation) with LangGraph ReAct agent, MCP Server, and Chroma vector database.
+A conversational AI assistant that answers questions about your documents using **RAG (Retrieval-Augmented Generation)** with a **LangGraph ReAct agent**, **MCP Server**, and **Chroma vector database**.
 
-## 🏗️ Architecture Overview
+![Python](https://img.shields.io/badge/Python-3.10--3.13-blue)
+![LangGraph](https://img.shields.io/badge/LangGraph-ReAct_Agent-green)
+![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4_Turbo-orange)
+![Docker](https://img.shields.io/badge/Docker-Ready-blue)
 
-The system follows a simplified RAG architecture with:
-- **LangGraph ReAct Agent**: Intelligent reasoning and tool calling
-- **MCP Server**: Primary context source for document retrieval
-- **Chroma Vector Store**: Persistent storage for embeddings, chunks, and metadata
-- **Streamlit UI**: Web interface for document upload and chat
+---
+
+## 📋 Table of Contents
+
+- [Features](#-features)
+- [Architecture](#-architecture)
+- [Technical Design](#-technical-design)
+- [Quick Start - Local Setup](#-quick-start---local-setup)
+- [Quick Start - Docker Setup](#-quick-start---docker-setup)
+- [Configuration](#-configuration)
+- [Project Structure](#-project-structure)
+- [RAG/LLM Approach & Decisions](#-ragllm-approach--decisions)
+- [Production Considerations](#-production-considerations)
+- [Testing](#-testing)
+- [Troubleshooting](#-troubleshooting)
+
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| **Document Upload** | Support for PDF, TXT, and Markdown files |
+| **Intelligent Chunking** | Recursive character splitting (1000 chars, 200 overlap) |
+| **Semantic Search** | Vector-based similarity search using Chroma |
+| **ReAct Agent** | LangGraph-powered agent with multi-step reasoning |
+| **MCP Integration** | Tool-based document access via Model Context Protocol |
+| **Persistent Storage** | Chroma vector store with local file persistence |
+| **Session Memory** | In-memory conversation history per session |
+| **Collection Management** | Clear all documents with one click |
+| **Source Citations** | Answers include references to source chunks |
+
+---
+
+## 🏗️ Architecture
+
+### High-Level Overview
 
 ```
-User Query → Streamlit UI → LangGraph ReAct Agent → MCP Server Tools → Chroma Vector Store
-                                                          ↓
-                                                    OpenAI LLM → Response
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              STREAMLIT UI                                    │
+│                         (Document Upload + Chat)                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          LANGGRAPH REACT AGENT                               │
+│                                                                              │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐              │
+│  │  THINK   │───▶│   ACT    │───▶│ OBSERVE  │───▶│ GENERATE │              │
+│  │(Reason)  │    │(Use Tool)│    │(Process) │    │(Respond) │              │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘              │
+│        ▲                                              │                      │
+│        └──────────────────────────────────────────────┘                      │
+│                      (Loop until answer ready)                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    ▼                                   ▼
+┌───────────────────────────────┐     ┌───────────────────────────────────────┐
+│        MCP SERVER             │     │            OPENAI API                  │
+│  (Model Context Protocol)     │     │                                        │
+│                               │     │  ┌─────────────┐  ┌─────────────────┐ │
+│  Tools:                       │     │  │ GPT-4 Turbo │  │ text-embedding- │ │
+│  • search_documents           │     │  │   (LLM)     │  │   3-small       │ │
+│  • get_document_chunk         │     │  └─────────────┘  └─────────────────┘ │
+│  • list_documents             │     │                                        │
+└───────────────────────────────┘     └───────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CHROMA VECTOR DATABASE                               │
+│                        (Local Persistent Storage)                            │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Collection: "documents"                                             │   │
+│   │  ├── Document Chunks (text content)                                  │   │
+│   │  ├── Embeddings (1536-dim vectors)                                   │   │
+│   │  └── Metadata (source, chunk_id, page_number)                        │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Storage: ./data/chroma_db/ (SQLite + HNSW index)                          │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 🚀 Quick Setup
+### Data Flow
+
+```
+1. DOCUMENT INGESTION
+   Upload PDF/TXT → Chunking (1000 chars) → Embedding → Store in Chroma
+
+2. QUERY PROCESSING
+   User Query → ReAct Agent → MCP Tools → Chroma Search → Retrieve Chunks
+
+3. RESPONSE GENERATION
+   Retrieved Chunks → Context Assembly → GPT-4 → Answer with Citations
+```
+
+### Component Interactions
+
+```
+┌────────────────┐      ┌────────────────┐      ┌────────────────┐
+│   Streamlit    │─────▶│  LangGraph     │─────▶│    OpenAI      │
+│   (app.py)     │◀─────│  ReAct Agent   │◀─────│    LLM API     │
+└────────────────┘      └────────────────┘      └────────────────┘
+        │                       │
+        │                       │ Tool Calls
+        │                       ▼
+        │               ┌────────────────┐
+        │               │   MCP Server   │
+        │               │   (stdio)      │
+        │               └────────────────┘
+        │                       │
+        │                       ▼
+        │               ┌────────────────┐
+        └──────────────▶│    Chroma      │
+        (Direct access) │  Vector Store  │
+                        └────────────────┘
+```
+
+---
+
+## 🔧 Technical Design
+
+### Core Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Config** | `src/config.py` | Pydantic settings, environment variable management |
+| **Document Processor** | `src/document_processor.py` | PDF/TXT loading, recursive chunking |
+| **Embeddings** | `src/embeddings.py` | OpenAI embedding generation wrapper |
+| **Vector Store** | `src/vector_store.py` | Chroma operations (add, search, delete) |
+| **MCP Server** | `src/mcp_server/` | Tool definitions, server setup |
+| **MCP Client** | `src/mcp_client.py` | MCP adapter for LangGraph |
+| **Retrieval** | `src/retrieval.py` | Hybrid retrieval (MCP + vector search) |
+| **Agent** | `src/agent.py` | LangGraph ReAct agent implementation |
+| **Prompts** | `src/prompts.py` | System prompts and templates |
+| **App** | `app.py` | Streamlit web interface |
+
+### Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| **Agent Framework** | LangGraph ReAct | Built-in reasoning loop, state management, tool integration |
+| **Vector Database** | Chroma (local) | Zero infrastructure cost, persistent, easy setup |
+| **LLM** | GPT-4-turbo | Best reasoning for ReAct, high-quality responses |
+| **Embeddings** | text-embedding-3-small | Cost-effective, 1536 dimensions, good quality |
+| **Context Protocol** | MCP (stdio) | Standardized tool access, LangChain adapters available |
+| **Memory** | Session-based (in-memory) | Simple, clears on refresh, no database needed |
+| **Chunking** | RecursiveCharacterTextSplitter | Preserves context, configurable overlap |
+
+### State Management
+
+```python
+# LangGraph Agent State
+{
+    "messages": List[BaseMessage],      # Conversation history (trimmed to last 10)
+    "context": str,                      # Retrieved document chunks
+    "iteration_count": int,              # ReAct loop counter
+    "final_response": str                # Generated answer
+}
+
+# Streamlit Session State
+{
+    "messages": List[dict],              # Chat display history
+    "agent": RAGAgent,                   # Agent instance
+    "vector_store": VectorStore,         # Chroma wrapper
+    "embedding_service": EmbeddingService,
+    "document_processor": DocumentProcessor
+}
+```
+
+### MCP Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `search_documents` | Semantic search across all documents | `query: str`, `top_k: int` |
+| `get_document_chunk` | Retrieve specific chunk by ID | `chunk_id: str` |
+| `list_documents` | List all stored document sources | None |
+
+---
+
+## 🚀 Quick Start - Local Setup
 
 ### Prerequisites
 
-- Python 3.10-3.13 (3.13 recommended)
-- Docker Desktop (for containerized deployment)
-- OpenAI API key
-- UV package manager (optional, but recommended)
+- **Python 3.10-3.13** (3.13 recommended)
+- **OpenAI API Key** ([Get one here](https://platform.openai.com/api-keys))
+- **Git** (for cloning)
 
-### Installation
+### Step 1: Clone the Repository
 
-#### Option 1: Automated Setup (Recommended)
+```bash
+git clone https://github.com/ayush-baunthiyal/AIAgent-Chat-With-Doc.git
+cd AIAgent-Chat-With-Doc
+```
 
-**Windows (PowerShell):**
-```powershell
+### Step 2: Create Virtual Environment
+
+**Option A: Using UV (Recommended - Faster)**
+```bash
+# Install UV if not already installed
+pip install uv
+
+# Create virtual environment
+uv venv
+
+# Activate virtual environment
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# Windows CMD:
+.\.venv\Scripts\activate.bat
+# Linux/Mac:
+source .venv/bin/activate
+```
+
+**Option B: Using standard Python venv**
+```bash
+python -m venv .venv
+
+# Activate (same as above)
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# Linux/Mac:
+source .venv/bin/activate
+```
+
+### Step 3: Install Dependencies
+
+```bash
+# Using UV (faster):
+uv pip install -e .
+
+# Or using pip:
+pip install -e .
+```
+
+### Step 4: Configure Environment
+
+```bash
+# Create .env file from template
+copy .env.example .env    # Windows
+cp .env.example .env      # Linux/Mac
+
+# Edit .env and add your OpenAI API key
+# OPENAI_API_KEY=sk-your-key-here
+```
+
+### Step 5: Run the Application
+
+```bash
+streamlit run app.py
+```
+
+**Open your browser: http://localhost:8501**
+
+### Quick Setup Script (Alternative)
+
+Instead of manual steps, use the automated setup:
+
+```bash
+# Windows PowerShell:
 .\setup.ps1
+
+# Linux/Mac:
+chmod +x setup.sh && ./setup.sh
+
+# Cross-platform Python:
+python setup.py
+```
+
+---
+
+## 🐳 Quick Start - Docker Setup
+
+### Prerequisites
+
+- **Docker Desktop** ([Download](https://www.docker.com/products/docker-desktop/))
+- **OpenAI API Key**
+
+### Step 1: Clone the Repository
+
+```bash
+git clone https://github.com/ayush-baunthiyal/AIAgent-Chat-With-Doc.git
+cd AIAgent-Chat-With-Doc
+```
+
+### Step 2: Create Environment File
+
+```bash
+# Create .env file
+copy .env.example .env    # Windows
+cp .env.example .env      # Linux/Mac
+
+# Edit .env and add your OpenAI API key
+# OPENAI_API_KEY=sk-your-key-here
+```
+
+### Step 3: Build Docker Image
+
+```bash
+docker build -t rag-chat-assistant .
+```
+
+### Step 4: Run Container
+
+**Windows PowerShell:**
+```powershell
+docker run -d --name rag-chat -p 8501:8501 --env-file .env -v "${PWD}/data:/app/data" rag-chat-assistant
 ```
 
 **Linux/Mac:**
 ```bash
-chmod +x setup.sh
-./setup.sh
+docker run -d --name rag-chat -p 8501:8501 --env-file .env -v "$(pwd)/data:/app/data" rag-chat-assistant
 ```
 
-**Cross-platform (Python):**
+**Open your browser: http://localhost:8501**
+
+### Docker Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `docker logs rag-chat` | View container logs |
+| `docker logs -f rag-chat` | Follow logs in real-time |
+| `docker stop rag-chat` | Stop the container |
+| `docker start rag-chat` | Start stopped container |
+| `docker rm rag-chat` | Remove container |
+| `docker rm -f rag-chat` | Force remove running container |
+
+### Rebuild After Code Changes
+
 ```bash
-python setup.py
+docker rm -f rag-chat
+docker build -t rag-chat-assistant .
+docker run -d --name rag-chat -p 8501:8501 --env-file .env -v "${PWD}/data:/app/data" rag-chat-assistant
 ```
 
-The setup script will:
-- ✅ Check Python version (3.10-3.13, 3.13 recommended)
-- ✅ Install UV package manager (optional)
-- ✅ Create necessary directories
-- ✅ Create .env file from template
-- ✅ Install all dependencies
-- ✅ Verify installation
+---
 
-#### Option 2: Manual Installation
+## ⚙️ Configuration
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd AIAgent-Chat-With-Doc
-   ```
+### Environment Variables (.env)
 
-2. **Install dependencies using UV**
-   ```bash
-   # Install UV if not already installed
-   pip install uv
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | *required* | Your OpenAI API key |
+| `OPENAI_MODEL` | `gpt-4-turbo-preview` | LLM model for responses |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Model for embeddings |
+| `CHROMA_DB_PATH` | `./data/chroma_db` | Path to Chroma database |
+| `CHROMA_COLLECTION_NAME` | `documents` | Chroma collection name |
+| `CHUNK_SIZE` | `1000` | Characters per chunk |
+| `CHUNK_OVERLAP` | `200` | Overlap between chunks |
+| `TOP_K_CHUNKS` | `5` | Chunks to retrieve per query |
+| `RELEVANCE_THRESHOLD` | `0.3` | Minimum relevance score (0-1) |
+| `MAX_ITERATIONS` | `10` | Max ReAct reasoning loops |
+| `TEMPERATURE` | `0.7` | LLM creativity (0-1) |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
 
-   # Install project dependencies
-   uv pip install -e .
-   ```
+### Example .env File
 
-   Or using pip:
-   ```bash
-   pip install -e .
-   ```
+```env
+# Required
+OPENAI_API_KEY=sk-your-api-key-here
 
-3. **Set up environment variables**
-   ```bash
-   cp .env.example .env
-   # Edit .env and add your OpenAI API key
-   ```
+# Optional - Model Configuration
+OPENAI_MODEL=gpt-4-turbo-preview
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
-4. **Run the application**
-   ```bash
-   streamlit run app.py
-   ```
+# Optional - Retrieval Configuration
+CHUNK_SIZE=1000
+CHUNK_OVERLAP=200
+TOP_K_CHUNKS=5
+RELEVANCE_THRESHOLD=0.3
 
-   Access the app at `http://localhost:8501`
+# Optional - Agent Configuration
+MAX_ITERATIONS=10
+TEMPERATURE=0.7
+```
 
-### Docker Deployment
-
-1. **Build the Docker image**
-   ```bash
-   docker build -t rag-chat-assistant .
-   ```
-
-2. **Run the container**
-   ```bash
-   docker run -p 8501:8501 \
-     -v $(pwd)/data:/app/data \
-     -v $(pwd)/.env:/app/.env \
-     rag-chat-assistant
-   ```
-
-   On Windows PowerShell:
-   ```powershell
-   docker run -p 8501:8501 `
-     -v ${PWD}/data:/app/data `
-     -v ${PWD}/.env:/app/.env `
-     rag-chat-assistant
-   ```
-
-## 📋 Features
-
-- **Document Upload**: Support for PDF, TXT, and MD files
-- **Intelligent Chunking**: Recursive character splitting with overlap (1000 chars, 200 overlap)
-- **Semantic Search**: Vector-based similarity search using Chroma
-- **ReAct Agent**: LangGraph-powered agent with reasoning capabilities
-- **MCP Integration**: Tool-based document access via MCP Server
-- **Persistent Storage**: Chroma vector store with local persistence
-- **Short-term Memory**: In-memory conversation history (session-based)
-
-## 🔧 Configuration
-
-Key configuration options in `.env`:
-
-- `OPENAI_API_KEY`: Your OpenAI API key (required)
-- `OPENAI_MODEL`: LLM model (default: `gpt-4-turbo-preview`)
-- `OPENAI_EMBEDDING_MODEL`: Embedding model (default: `text-embedding-3-small`)
-- `CHROMA_DB_PATH`: Path to Chroma database (default: `./data/chroma_db`)
-- `CHUNK_SIZE`: Chunk size in characters (default: `1000`)
-- `CHUNK_OVERLAP`: Overlap between chunks (default: `200`)
-- `TOP_K_CHUNKS`: Number of chunks to retrieve (default: `5`)
-- `MAX_ITERATIONS`: Max ReAct iterations (default: `10`)
-
-## 🧩 Tech Stack
-
-- **Python 3.10-3.13**: Programming language (3.13 recommended)
-- **UV**: Fast Python package manager
-- **OpenAI**: LLM and embeddings
-- **LangGraph**: Agent orchestration framework
-- **LangChain**: LLM framework and MCP adapters
-- **Chroma**: Vector database (local persistent mode)
-- **Streamlit**: Web UI framework
-- **MCP**: Model Context Protocol for tool integration
-- **Docker**: Containerization
+---
 
 ## 📁 Project Structure
 
 ```
 AIAgent-Chat-With-Doc/
+├── app.py                      # Streamlit main application
 ├── src/
 │   ├── __init__.py
-│   ├── config.py                 # Configuration management
-│   ├── document_processor.py     # PDF/text loading and chunking
-│   ├── embeddings.py             # Embedding generation service
-│   ├── vector_store.py           # Chroma vector store wrapper
-│   ├── mcp_client.py             # MCP Server client
-│   ├── mcp_server/               # Local MCP Server
+│   ├── config.py               # Pydantic settings management
+│   ├── document_processor.py   # PDF/text loading and chunking
+│   ├── embeddings.py           # OpenAI embedding wrapper
+│   ├── vector_store.py         # Chroma vector store operations
+│   ├── mcp_client.py           # MCP adapter for LangGraph
+│   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   ├── server.py             # MCP Server setup
-│   │   └── tools.py              # MCP tools for document operations
-│   ├── retrieval.py              # Hybrid retrieval service
-│   ├── agent.py                  # LangGraph ReAct agent
-│   ├── prompts.py                # Prompt templates
-│   └── utils.py                  # Helper functions
-├── app.py                        # Streamlit main application
-├── data/                         # Data directory (gitignored)
-│   └── chroma_db/               # Chroma persistent storage
-├── tests/                        # Unit tests
-├── pyproject.toml                # UV package configuration
-├── Dockerfile                    # Docker container definition
-├── .env.example                  # Environment variables template
-└── README.md                     # This file
+│   │   ├── server.py           # MCP server setup
+│   │   └── tools.py            # Document search/retrieval tools
+│   ├── retrieval.py            # Hybrid retrieval service
+│   ├── agent.py                # LangGraph ReAct agent
+│   ├── prompts.py              # System prompts and templates
+│   └── utils.py                # Helper functions
+├── data/
+│   └── chroma_db/              # Chroma persistent storage
+├── tests/
+│   ├── __init__.py
+│   └── test_document_processor.py
+├── pyproject.toml              # Project dependencies (UV/pip)
+├── Dockerfile                  # Container definition
+├── setup.py                    # Cross-platform setup script
+├── setup.ps1                   # Windows PowerShell setup
+├── setup.sh                    # Linux/Mac setup
+├── .env.example                # Environment template
+├── .gitignore
+└── README.md
 ```
+
+---
 
 ## 🔍 RAG/LLM Approach & Decisions
 
 ### LLM Selection
-- **Primary**: GPT-4-turbo (high quality, good reasoning)
-- **Fallback**: GPT-3.5-turbo (cost-effective alternative)
-- **Rationale**: GPT-4 provides better reasoning for ReAct agent, GPT-3.5 for cost optimization
 
-### Embedding Model
+| Model | Use Case | Rationale |
+|-------|----------|-----------|
+| **GPT-4-turbo** | Primary LLM | Best reasoning for ReAct agent, high-quality responses |
+| **GPT-3.5-turbo** | Cost alternative | Lower cost, faster, acceptable for simple queries |
+
+### Embedding Strategy
+
 - **Model**: `text-embedding-3-small` (1536 dimensions)
-- **Rationale**: Cost-effective, good quality, sufficient dimensions for semantic search
-
-### Vector Database
-- **Choice**: Chroma (local persistent mode)
-- **Rationale**: 
-  - Zero infrastructure costs (local file storage)
-  - Easy setup, no external dependencies
-  - Persistent storage (survives restarts)
-  - Good performance for local use cases
-
-### Orchestration Framework
-- **Choice**: LangGraph
-- **Rationale**:
-  - Built-in ReAct pattern support
-  - State management
-  - Tool integration
-  - Extensible workflow
+- **Why**: Cost-effective ($0.02/1M tokens), good semantic quality
+- **Alternative**: `text-embedding-3-large` for higher accuracy at 2x cost
 
 ### Chunking Strategy
-- **Method**: Recursive character splitting with overlap
-- **Size**: 1000 characters
-- **Overlap**: 200 characters
-- **Rationale**: Balances context preservation with retrieval granularity
 
-### Retrieval Approach
-- **Primary**: MCP Server tools (structured, tool-based access)
-- **Fallback**: Direct Chroma vector search (semantic similarity)
-- **Top-k**: 5 chunks per query
-- **Re-ranking**: Relevance threshold filtering (>0.7)
+```python
+RecursiveCharacterTextSplitter(
+    chunk_size=1000,      # ~250 words per chunk
+    chunk_overlap=200,    # 20% overlap for context
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+```
+
+**Rationale**: Balances context preservation with retrieval granularity. Overlap prevents losing information at chunk boundaries.
+
+### Retrieval Pipeline
+
+1. **Query Embedding**: User query → 1536-dim vector
+2. **Similarity Search**: Chroma HNSW index → top-k candidates
+3. **Relevance Filtering**: Score threshold (>0.3) → filtered results
+4. **Context Assembly**: Concatenate chunks with metadata
+
+### ReAct Agent Loop
+
+```
+1. THINK: Analyze query, plan approach
+2. ACT: Call MCP tools (search_documents, get_chunk)
+3. OBSERVE: Process tool results
+4. REPEAT: Until sufficient context gathered
+5. GENERATE: Synthesize final answer with citations
+```
 
 ### Prompt Engineering
-- **ReAct System Prompt**: Instructions for reasoning, tool usage, and decision-making
-- **Final Response Prompt**: Context assembly with source citations
-- **Techniques**: Chain-of-thought reasoning, tool selection guidance, context synthesis
 
-### Guardrails & Quality
-- Input sanitization (prevent prompt injection)
-- Response validation (ensure answers reference documents)
-- Token limits (prevent context overflow)
-- Relevance filtering (threshold-based)
-- Error handling and fallbacks
+- **System Prompt**: ReAct instructions, tool usage guidelines
+- **Context Prompt**: Retrieved chunks with source metadata
+- **Response Prompt**: Citation format, answer structure
 
-### Observability
-- Structured logging (query, retrieval, response)
-- Performance metrics (latency tracking)
-- Error tracking with context
+---
 
 ## 🚢 Production Considerations
 
 ### Current State (Local Deployment)
-- ✅ Local Docker Desktop deployment
-- ✅ Persistent Chroma storage
-- ✅ Environment-based configuration
-- ✅ Basic logging and error handling
 
-### What Would Be Required for Production
+✅ Local Docker Desktop deployment  
+✅ Persistent Chroma storage  
+✅ Environment-based configuration  
+✅ Basic logging and error handling  
+✅ Session-based conversation memory  
+✅ Context length management (message trimming)  
 
-#### Scalability
-- **Horizontal Scaling**: Multiple app instances with shared Chroma directory (or move to cloud vector DB)
-- **Caching Layer**: Redis for frequent queries (can run in Docker locally)
-- **Load Balancing**: Nginx or similar (can run in Docker)
-- **Async Processing**: Background tasks for document ingestion
+### Scaling for Production
 
-#### Deployment (Cloud)
-- **Container Orchestration**: Kubernetes/ECS for multi-instance deployment
-- **Cloud Vector DB**: Pinecone/Weaviate for distributed access
-- **Managed Services**: Use cloud-managed databases and services
-- **CI/CD Pipeline**: Automated testing and deployment
+| Area | Local | Production |
+|------|-------|------------|
+| **Vector DB** | Chroma (local file) | Pinecone, Weaviate, Qdrant (cloud) |
+| **LLM** | OpenAI API | Azure OpenAI, self-hosted LLM |
+| **Memory** | Session (in-memory) | Redis, PostgreSQL |
+| **Orchestration** | Single container | Kubernetes, ECS |
+| **Monitoring** | Console logs | Datadog, New Relic, LangSmith |
+| **Auth** | None | OAuth, API keys |
 
-#### Monitoring
-- **APM**: Application Performance Monitoring (e.g., Datadog, New Relic)
-- **LLM Cost Tracking**: Monitor OpenAI API usage and costs
-- **User Analytics**: Track usage patterns and queries
-- **Alerting**: Set up alerts for errors and performance issues
+### Security Checklist
 
-#### Security
-- **API Key Management**: AWS Secrets Manager, Azure Key Vault, or similar
-- **Authentication**: User authentication/authorization
-- **Data Encryption**: Encryption at rest and in transit
-- **Input Validation**: Enhanced sanitization and validation
-- **Rate Limiting**: Per-user rate limits
+- [ ] API key management (secrets manager)
+- [ ] Input sanitization (prompt injection prevention)
+- [ ] Rate limiting per user
+- [ ] Data encryption at rest
+- [ ] HTTPS termination
+- [ ] Authentication/authorization
 
-#### Quality & Testing
-- **Integration Tests**: End-to-end testing
-- **Performance Tests**: Load testing and benchmarking
-- **Quality Metrics**: RAG evaluation metrics (retrieval accuracy, answer quality)
-- **A/B Testing**: Compare different retrieval strategies
+---
 
 ## 🧪 Testing
 
-Run tests with:
 ```bash
+# Run all tests
 pytest tests/
-```
 
-With coverage:
-```bash
+# Run with coverage
 pytest tests/ --cov=src --cov-report=html
+
+# Run specific test file
+pytest tests/test_document_processor.py -v
 ```
 
-## 🛠️ Engineering Standards
+---
 
-- **Code Quality**: Type hints, docstrings, PEP 8 compliance
-- **Package Management**: UV with `pyproject.toml`
-- **Testing**: Unit tests for core logic (target 70%+ coverage)
-- **Documentation**: Inline comments, README, architecture docs
-- **Version Control**: Clear commit messages, feature branches
-- **Dependencies**: Pinned versions in `pyproject.toml`
-- **Containerization**: Multi-stage Docker builds
+## 🔧 Troubleshooting
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| **PowerShell script disabled** | Run: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
+| **Python 3.14+ errors** | Use Python 3.10-3.13 (onnxruntime compatibility) |
+| **Docker context errors** | Run: `docker context use desktop-linux` |
+| **localhost:8501 not loading** | Wait 10 seconds for Streamlit startup |
+| **"Checkpointer requires thread_id"** | Update to latest code (MemorySaver removed) |
+| **Context length exceeded** | Conversation is auto-trimmed (last 10 messages) |
+| **No results found** | Lower `RELEVANCE_THRESHOLD` in .env |
+
+### Logs
+
+**Local:**
+```bash
+# Check Streamlit output in terminal
+streamlit run app.py
+```
+
+**Docker:**
+```bash
+docker logs rag-chat
+docker logs -f rag-chat  # Follow logs
+```
+
+---
 
 ## 🤖 AI Tool Usage
 
-### How AI Tools Were Used
-- **Boilerplate Code**: Generated initial project structure and configuration files
-- **Documentation Templates**: Created README and docstring templates
-- **Code Generation**: Assisted with LangGraph and MCP integration patterns
-- **Debugging Help**: Troubleshooting integration issues
+### How AI Was Used
 
-### Do's and Don'ts
+- ✅ Boilerplate code generation
+- ✅ Documentation templates
+- ✅ LangGraph/MCP integration patterns
+- ✅ Debugging assistance
 
-**Do's:**
-- ✅ Use AI for repetitive tasks and boilerplate
-- ✅ Review all AI-generated code before committing
-- ✅ Test thoroughly, especially integrations
-- ✅ Document AI-assisted sections in comments
-- ✅ Understand the code you're using
+### Best Practices
 
-**Don'ts:**
-- ❌ Don't blindly accept AI suggestions
-- ❌ Don't use AI for critical architectural decisions without review
-- ❌ Don't skip testing AI-generated code
-- ❌ Don't use AI outputs directly in README (write your own thoughts)
+**Do:**
+- Review all AI-generated code
+- Test thoroughly
+- Understand the code you're using
 
-## 🔮 Future Enhancements
+**Don't:**
+- Blindly accept suggestions
+- Skip testing
+- Use AI for critical security code without review
 
-With more time, I would add:
-
-1. **Enhanced MCP Integration**: Full tool binding and async tool calling
-2. **Advanced ReAct Loop**: More sophisticated reasoning and multi-step planning
-3. **Conversation Memory**: Persistent conversation history (SQLite or similar)
-4. **Document Management**: Delete, update, and organize documents
-5. **Multi-document Queries**: Cross-document reasoning
-6. **Citation Tracking**: Better source attribution and references
-7. **Export Functionality**: Export conversations and document summaries
-8. **Performance Optimization**: Caching, batch processing, async operations
-9. **Quality Metrics**: RAG evaluation and quality scoring
-10. **User Feedback**: Thumbs up/down for continuous improvement
+---
 
 ## 📝 License
 
-[Add your license here]
+MIT License - Feel free to use and modify.
+
+---
 
 ## 👤 Author
 
-[Your name/contact information]
+**Ayush Baunthiyal**  
+Staff Software Engineer / AI Engineer
+
+---
+
+## 🔮 Future Enhancements
+
+1. **Streaming responses** - Token-by-token display
+2. **Multi-document reasoning** - Cross-document queries
+3. **Persistent memory** - SQLite conversation history
+4. **Document management** - Delete/update specific documents
+5. **Export functionality** - Save conversations
+6. **Quality metrics** - RAG evaluation scoring
+7. **User feedback** - Thumbs up/down for improvement
