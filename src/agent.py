@@ -1,3 +1,29 @@
+# =============================================================================
+# LANGGRAPH REACT AGENT - The "Brain" of the RAG Chat Assistant
+# =============================================================================
+#
+# This module implements the core AI agent using LangGraph's ReAct pattern.
+# ReAct stands for "Reasoning and Acting" - the agent thinks about what to do,
+# takes actions (like searching documents), observes results, and generates answers.
+#
+# Architecture Flow:
+#     User Question --> Think Node --> Retrieve Node --> Generate Node --> Answer
+#
+# Why LangGraph?
+#     - Built-in state management (tracks conversation context)
+#     - Easy to define multi-step reasoning workflows
+#     - Integrates well with LangChain tools
+#
+# Key Design Decisions:
+#     1. No MemorySaver checkpointer - We manage chat history in Streamlit's
+#        session_state instead. This prevents unbounded memory growth.
+#     2. Message trimming to last 10 messages - Prevents exceeding OpenAI's
+#        128K token context limit.
+#     3. Simple linear flow (think -> retrieve -> generate) - More complex
+#        ReAct loops with tool calling can be added later.
+#
+# =============================================================================
+
 """LangGraph ReAct agent implementation."""
 
 from typing import TypedDict, Annotated, Sequence, List
@@ -16,158 +42,290 @@ from src.utils import get_logger, setup_logging
 setup_logging()
 logger = get_logger(__name__)
 
-# Maximum number of messages to keep in context to avoid token overflow
+# -----------------------------------------------------------------------------
+# IMPORTANT: This limit prevents the "context_length_exceeded" error from OpenAI.
+# GPT-4-turbo has a 128K token limit. Each message can be ~1000+ tokens.
+# Keeping only the last 10 messages ensures we stay well under the limit.
+# -----------------------------------------------------------------------------
 MAX_HISTORY_MESSAGES = 10
 
 
 class AgentState(TypedDict):
-    """State schema for ReAct agent."""
-
+    """
+    State schema for the ReAct agent.
+    
+    This is the "memory" that flows through the LangGraph nodes.
+    Each node can read from and write to this state.
+    
+    Fields:
+        messages: List of conversation messages (human and AI). Uses the 'add'
+                  operator to append new messages rather than replace.
+        retrieved_context: Document chunks found by the retrieval system.
+                          This gets injected into the final prompt.
+        iteration_count: Tracks how many reasoning loops we've done.
+                        Useful for debugging and preventing infinite loops.
+    """
     messages: Annotated[Sequence[BaseMessage], add]
     retrieved_context: str
     iteration_count: int
 
 
 class ReActAgent:
-    """LangGraph ReAct agent for document Q&A."""
+    """
+    LangGraph ReAct agent for document Q&A.
+    
+    This is the main class that orchestrates the entire question-answering flow:
+    1. Takes a user question
+    2. Retrieves relevant document chunks from the vector store
+    3. Uses GPT-4 to generate an answer based on the retrieved context
+    
+    The agent uses a state machine pattern where each "node" is a processing step.
+    
+    Example Usage:
+        retrieval_service = RetrievalService(vector_store)
+        agent = ReActAgent(retrieval_service)
+        answer = agent.invoke("What is the person's experience?")
+    """
 
     def __init__(self, retrieval_service: RetrievalService, tools: list = None):
         """
-        Initialize ReAct agent.
+        Initialize the ReAct agent.
 
         Args:
-            retrieval_service: Retrieval service instance
-            tools: Optional list of tools (will use retrieval service if not provided)
+            retrieval_service: The service that fetches relevant document chunks.
+                              This connects to the Chroma vector database.
+            tools: Optional MCP tools for advanced use cases. If not provided,
+                   the agent uses the retrieval_service directly.
         """
         self.retrieval_service = retrieval_service
+        
+        # Initialize the OpenAI LLM (Large Language Model)
+        # This is what generates the actual responses
         self.llm = ChatOpenAI(
-            model=settings.openai_model,
-            temperature=settings.temperature,
+            model=settings.openai_model,          # e.g., "gpt-4-turbo-preview"
+            temperature=settings.temperature,      # 0.7 = balanced creativity
             api_key=settings.openai_api_key,
         )
 
-        # Bind tools to LLM if provided
+        # If MCP tools are provided, bind them to the LLM
+        # This allows the LLM to call tools like search_documents
         if tools:
             self.llm_with_tools = self.llm.bind_tools(tools)
         else:
-            # Create a simple tool that uses retrieval service
+            # No tools - agent will use retrieval service directly
             self.llm_with_tools = self.llm
 
-        # Build the graph
+        # Build the LangGraph state machine
         self.graph = self._build_graph(tools)
 
-        # Compile without checkpointer - we manage chat history in Streamlit session_state
-        # This prevents token overflow from accumulated messages
+        # Compile the graph into an executable application
+        # NOTE: We intentionally do NOT use a checkpointer here.
+        # The checkpointer would accumulate all messages forever, causing
+        # the "context_length_exceeded" error we fixed earlier.
         self.app = self.graph.compile()
 
     def _build_graph(self, tools: list = None) -> StateGraph:
-        """Build the LangGraph workflow."""
+        """
+        Build the LangGraph workflow (state machine).
+        
+        This defines the processing pipeline:
+        
+            START --> think --> retrieve --> generate --> END
+        
+        Each node is a function that transforms the agent state.
+        
+        Args:
+            tools: Optional MCP tools (for future tool-calling support)
+            
+        Returns:
+            A configured StateGraph ready to be compiled
+        """
+        # Create a new state graph with our AgentState schema
         workflow = StateGraph(AgentState)
 
-        # Add nodes
-        workflow.add_node("think", self._think_node)
-        workflow.add_node("retrieve", self._retrieve_node)
-        workflow.add_node("generate", self._generate_node)
+        # ----- Add processing nodes -----
+        # Each node is a function that takes state and returns updated state
+        
+        workflow.add_node("think", self._think_node)       # Analyze the question
+        workflow.add_node("retrieve", self._retrieve_node) # Fetch relevant docs
+        workflow.add_node("generate", self._generate_node) # Create the answer
 
-        # Add tool node if tools are provided
+        # Add tool node if MCP tools are provided (for advanced use cases)
         if tools:
             tool_node = ToolNode(tools)
             workflow.add_node("tools", tool_node)
 
-        # Set entry point
+        # ----- Define the flow -----
+        # This is a simple linear flow: think -> retrieve -> generate -> done
         workflow.set_entry_point("think")
-
-        # Add edges
         workflow.add_edge("think", "retrieve")
         workflow.add_edge("retrieve", "generate")
         workflow.add_edge("generate", END)
 
-        # Add conditional edge for tools if available
+        # Future enhancement: Add conditional edges for tool calling
+        # This would allow the agent to decide whether to use tools
         if tools:
-            # This would need conditional logic to decide when to use tools
-            pass
+            pass  # TODO: Implement conditional tool routing
 
         return workflow
 
     def _trim_messages(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """
-        Trim messages to prevent context overflow.
-        Keeps the most recent messages up to MAX_HISTORY_MESSAGES.
+        Trim the message history to prevent context overflow.
+        
+        WHY THIS IS IMPORTANT:
+        OpenAI's GPT-4-turbo has a 128,000 token limit. If we send too many
+        messages, we get the "context_length_exceeded" error. By keeping only
+        the most recent messages, we ensure the conversation stays within limits.
+        
+        Args:
+            messages: Full list of conversation messages
+            
+        Returns:
+            Trimmed list with at most MAX_HISTORY_MESSAGES (10) messages
         """
         if len(messages) <= MAX_HISTORY_MESSAGES:
             return messages
         
-        # Keep the most recent messages
+        # Keep only the most recent messages
+        # This means older context is lost, but prevents crashes
         trimmed = messages[-MAX_HISTORY_MESSAGES:]
         logger.info(f"Trimmed message history from {len(messages)} to {len(trimmed)} messages")
         return trimmed
 
     def _think_node(self, state: AgentState) -> AgentState:
-        """Think node: Analyze the query and decide what to retrieve."""
+        """
+        Think Node: Analyze the user's question and prepare for retrieval.
+        
+        This is the first step in the ReAct loop. The LLM looks at the question
+        and thinks about what information it needs to answer it.
+        
+        In a more advanced implementation, this node would:
+        - Decompose complex questions into sub-questions
+        - Decide which tools to use
+        - Plan a multi-step retrieval strategy
+        
+        Current implementation: Simply passes the message through with a system prompt.
+        
+        Args:
+            state: Current agent state with messages
+            
+        Returns:
+            Updated state with LLM's reasoning added to messages
+        """
         messages = state.get("messages", [])
         last_message = messages[-1] if messages else None
 
+        # Only process if the last message is from a human (user)
         if isinstance(last_message, HumanMessage):
-            # Add system prompt for reasoning
+            # Add the system prompt that tells the LLM how to behave
             system_msg = SystemMessage(content=REACT_SYSTEM_PROMPT)
             messages_with_system = [system_msg] + list(messages)
 
-            # Get LLM reasoning (simplified - in full ReAct, this would be more complex)
+            # Get the LLM's reasoning about how to answer
             response = self.llm_with_tools.invoke(messages_with_system)
+            
+            # Add the LLM's response to the message history
             state["messages"] = list(messages) + [response]
 
         return state
 
     def _retrieve_node(self, state: AgentState) -> AgentState:
-        """Retrieve node: Get relevant context from documents."""
+        """
+        Retrieve Node: Fetch relevant document chunks from the vector store.
+        
+        This is where the RAG (Retrieval-Augmented Generation) magic happens:
+        1. Extract the query from the conversation
+        2. Search the Chroma vector database for similar content
+        3. Store the retrieved chunks in the state for the generate node
+        
+        The retrieval service uses semantic search - it finds documents that
+        are conceptually similar to the query, not just keyword matches.
+        
+        Args:
+            state: Current agent state
+            
+        Returns:
+            State with retrieved_context populated with relevant chunks
+        """
         messages = state.get("messages", [])
         last_message = messages[-1] if messages else None
 
         if isinstance(last_message, (HumanMessage, AIMessage)):
-            # Extract query from last message
+            # Extract the query text from the message
+            # For human messages, use the content directly
+            # For AI messages, this might contain tool call info
             query = last_message.content if isinstance(last_message, HumanMessage) else None
 
             if not query and isinstance(last_message, AIMessage):
-                # Try to extract query from AI message (if it contains tool calls)
+                # Fallback: use AI message content as query
                 query = str(last_message.content)
 
             if query:
-                # Retrieve relevant context
+                # Search the vector store for relevant document chunks
+                # This returns chunks sorted by semantic similarity
                 results = self.retrieval_service.retrieve(query=query)
+                
+                # Format the results into a context string
+                # This will be injected into the prompt for the LLM
                 context = self.retrieval_service.get_context_text(results)
                 state["retrieved_context"] = context
+                
                 logger.info(f"Retrieved context with {len(results)} chunks")
 
         return state
 
     def _generate_node(self, state: AgentState) -> AgentState:
-        """Generate node: Create final response with context."""
+        """
+        Generate Node: Create the final answer using the retrieved context.
+        
+        This is the final step where we:
+        1. Take the user's question
+        2. Combine it with the retrieved document chunks
+        3. Ask the LLM to generate an answer based on this context
+        
+        The prompt instructs the LLM to:
+        - Only use information from the provided context
+        - Cite sources (document name and chunk index)
+        - Admit when it doesn't have the information
+        
+        Args:
+            state: State containing messages and retrieved_context
+            
+        Returns:
+            State with the final AI response added to messages
+        """
         messages = state.get("messages", [])
         retrieved_context = state.get("retrieved_context", "")
         iteration_count = state.get("iteration_count", 0) + 1
 
-        # Get user question (last human message)
+        # Find the user's original question (last human message)
         user_question = None
         conversation_history = []
+        
         for msg in messages:
             if isinstance(msg, HumanMessage):
                 user_question = msg.content
             elif isinstance(msg, AIMessage):
+                # Keep track of previous AI responses for context
                 conversation_history.append(f"Assistant: {msg.content}")
 
         if user_question:
-            # Format conversation history
+            # Format recent conversation history (last 3 exchanges)
             history_text = "\n".join(conversation_history[-3:]) if conversation_history else "None"
 
-            # Create prompt with context
+            # Build the final prompt with context injection
+            # This is the key RAG step - we give the LLM the retrieved documents
             prompt = FINAL_RESPONSE_PROMPT.format(
-                context=retrieved_context,
-                conversation_history=history_text,
-                question=user_question,
+                context=retrieved_context,           # Document chunks go here
+                conversation_history=history_text,   # Recent conversation
+                question=user_question,              # The user's question
             )
 
-            # Generate response
+            # Generate the final response
             response = self.llm.invoke([HumanMessage(content=prompt)])
+            
+            # Update state with the response
             state["messages"] = list(messages) + [response]
             state["iteration_count"] = iteration_count
 
@@ -175,38 +333,50 @@ class ReActAgent:
 
     def invoke(self, query: str, config: dict = None, chat_history: List[BaseMessage] = None) -> str:
         """
-        Invoke the agent with a query.
-
+        Main entry point: Run the agent with a user query.
+        
+        This is the method you call to get an answer from the agent.
+        It orchestrates the entire flow: think -> retrieve -> generate.
+        
         Args:
-            query: User query
-            config: Optional configuration (not used, kept for compatibility)
-            chat_history: Optional list of previous messages for context
-
+            query: The user's question (e.g., "What is this person's experience?")
+            config: Optional configuration (kept for API compatibility, not used)
+            chat_history: Optional previous messages for context. These are
+                         trimmed to prevent token overflow.
+        
         Returns:
-            Agent response
+            The agent's answer as a string, with source citations
+        
+        Example:
+            response = agent.invoke("What college did they attend?")
+            print(response)  # "Based on the document, they attended..."
         """
-        # Build initial messages with optional chat history
+        # Start with any provided chat history
         messages = []
         if chat_history:
-            # Trim chat history to avoid context overflow
+            # IMPORTANT: Trim history to prevent context overflow
             messages = self._trim_messages(chat_history)
         
-        # Add current query
+        # Add the current user query
         messages.append(HumanMessage(content=query))
         
+        # Initialize the agent state
         initial_state = {
             "messages": messages,
             "retrieved_context": "",
             "iteration_count": 0,
         }
 
+        # Run the LangGraph workflow
+        # This executes: think -> retrieve -> generate
         result = self.app.invoke(initial_state)
 
-        # Extract final response
+        # Extract the final response from the result
         messages = result.get("messages", [])
         if messages:
             last_message = messages[-1]
             if isinstance(last_message, AIMessage):
                 return last_message.content
 
+        # Fallback if something went wrong
         return "I apologize, but I couldn't generate a response."
